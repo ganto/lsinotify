@@ -27,32 +27,46 @@ from optparse import OptionParser
 DEBUG = False
 
 
-class MountManager():
+class NamespaceMountTab():
+    """
+    Collection of file system mounts as seen from a process namespace.
+    """
     mounts = list()
 
-    def __init__(self, pid):
-        fs_mounts = subprocess.check_output(
-            ["nsenter", "--target", str(pid), "--mount", "--pid", "--",
-             "mount"]
-        )
-        for mount in fs_mounts.split('\n')[:-1]:
+    def __init__(self, proc):
+        # query mounted file systems in process mount/pid namespace
+        mounted_filesystems = subprocess.check_output(
+            ["nsenter", "--target", str(proc.get_pid()), "--mount", "--pid",
+             "--", "mount"]
+        ).split('\n')[:-1]
+
+        # create a NamespaceMount object that can be queried for an inode later
+        for line in mounted_filesystems:
+            # line will contain something like:
+            #   tmpfs on /run type tmpfs (rw,nosuid,nodev,seclabel,mode=755)
+            device, _, mountpoint, _, fstype, _ = line.split()
             try:
-                self.mounts.append(Mount(mountpoint=mount.split()[2], pid=pid))
+                self.mounts.append(
+                    NamespaceMount(device=device,
+                                   mountpoint=mountpoint,
+                                   fstype=fstype,
+                                   pid=proc.get_pid())
+                )
             except subprocess.CalledProcessError:
-                # this will happen when the mount point cannot be read, so far
-                # this only happend for a gvfs mount, therefore skip for now
+                # exception thrown when mount point cannot be read, so far
+                # this only happend for a gvfs mount... skip for now
                 continue
 
     def get_mount_by_device_number(self, device_number):
         for mount in self.mounts:
-            if mount.device_number == device_number:
+            if device_number == mount.get_device_number():
                 return mount
         return None
 
 
-class Mount():
+class NamespaceMount():
     """
-    File system mount
+    File system mount as seen from a process namespace.
     """
     device = None
     device_number = None
@@ -60,31 +74,27 @@ class Mount():
     mountpoint = None
     pid = None
 
-    def __init__(self, mountpoint, pid):
+    def __init__(self, device, mountpoint, fstype, pid):
+        self.device = device
+        self.fstype = fstype
         self.mountpoint = mountpoint
-        self.fstype = subprocess.check_output(
-            ["nsenter", "--target", str(pid), "--mount", "--pid", "--",
-             "findmnt", "--noheadings", "--output", "FSTYPE", "%s" %
-             self.mountpoint]
-        ).strip()
-        self.device = subprocess.check_output(
-            ["nsenter", "--target", str(pid), "--mount", "--pid", "--",
-             "findmnt", "--noheadings", "--output", "SOURCE", "%s" %
-             self.mountpoint]
-        ).strip()
+        # store pid-reference for mount
+        self.pid = pid
+
+        # query device number of the mounts from within the namespace
         self.device_number = int(subprocess.check_output(
             ["nsenter", "--target", str(pid), "--mount", "--pid", "--",
              "stat", "-c %d", "%s" % mountpoint])
         )
-        # store pid-reference for mount
-        # TODO: replace with proper namespace handling
-        self.pid = pid
 
         debug("%s" % self)
 
     def __str__(self):
-        return "Mount({'mountpoint': '%s', 'fstype': '%s', 'device_number': %x})" % \
-            (self.mountpoint, self.fstype, self.device_number)
+        return "NamespaceMount({'device': %s, " % self.device + \
+            "'device_number': %x, " % self.device_number + \
+            "'mountpoint': '%s', " % self.mountpoint + \
+            "'fstype': '%s', " % self.fstype + \
+            "'pid': %s})" % self.pid
 
     def get_device(self):
         return self.device
@@ -92,9 +102,15 @@ class Mount():
     def get_device_number(self):
         return self.device_number
 
+    def get_fstype(self):
+        return self.fstype
+
+    def get_mountpoint(self):
+        return self.mountpoint
+
     def get_path(self, inode):
         # debugfs is much faster than find, but only available for ext2/3/4
-        if self.fstype in ['ext2', 'ext3', 'ext4']:
+        if self.get_fstype() in ['ext2', 'ext3', 'ext4']:
             cmd = ["nsenter", "--target", str(self.pid), "--mount", "--pid",
                    "--", "debugfs", self.get_device(), "-R", "ncheck %s" %
                    inode]
@@ -122,25 +138,21 @@ class Mount():
             # multiple paths are returned(?!)
             path = path_list[0]
 
-        debug("Mount.get_path() : cmd = '%s'" % " ".join(cmd))
-        debug("Mount.get_path() : path = %s" % path)
+        debug("NamespaceMount.get_path(): cmd = '%s'" % " ".join(cmd))
+        debug("NamespaceMount.get_path(): path = %s" % path)
 
         return path
 
-    def get_mountpoint(self):
-        return self.mountpoint
-
 
 class FsNotifyHandle():
-    '''
-    Store information about fsnotify handle. See documentation in section 3.8 at:
+    """
+    Store information about fsnotify handle. See description in section 3.8
+    of the kernel proc filesystem documentation at:
         https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/Documentation/filesystems/proc.txt?h=linux-3.10.y
 
     @param info  fdinfo line (e.g. 'inotify wd:4 ino:596 sdev:13 mask:d84 ignored_mask:0 fhandle-bytes:c fhandle-type:1 f_handle:2252865b9605000000000000')
-    '''
-
+    """
     def __init__(self, info):
-        #    print("DEBUG : %s" % info)
         for item in info.split():
             if item.startswith('inotify'):
                 continue
@@ -188,7 +200,6 @@ class Process():
     """
     Represents an Linux process with the given PID (process id).
     """
-
     def __init__(self, pid=os.getpid()):
         self.pid = int(pid)
 
@@ -199,15 +210,19 @@ class Process():
             # cmdline arguments are \0 seperated
             self.cmdline = cmd_fd.readline().replace('\0', ' ').strip()
 
-        self.uid = int(subprocess.check_output(
-            ["ps", "--no-headings", "-o", "uid", "-p", "%d" % self.pid]
-        ).strip())
+        self.uid, self.mount_ns, self.pid_ns = [
+            int(result.strip()) for result in subprocess.check_output(
+                ["ps", "--no-headings", "-o", "uid,mntns,pidns",
+                 "-p", "%d" % self.pid]
+            ).split()
+        ]
 
         debug("%s" % self)
 
     def __str__(self):
-        return "Process({'cmdline': '%s', 'pid': %d, 'uid': %d})" % \
-            (self.cmdline, self.pid, self.uid)
+        return "Process({'pid': %d, 'uid': %d, " % (self.pid, self.uid) + \
+            "'mount_ns': %d, 'pid_ns': %s, " % (self.mount_ns, self.pid_ns) + \
+            "'cmdline': '%s'})" % (self.cmdline)
 
     def get_cmdline(self):
         return self.cmdline
@@ -228,8 +243,14 @@ class Process():
                     watches.append(info)
         return watches
 
+    def get_mount_namespace(self):
+        return self.mount_ns
+
     def get_pid(self):
         return self.pid
+
+    def get_pid_namespace(self):
+        return self.pid_ns
 
     def get_uid(self):
         return self.uid
@@ -297,7 +318,9 @@ def main(argv=None):
 
 
 def get_inotify_watches(pids, restrict_uid=None):
+    namespace_mtabs = {}
     inotify_watches = {}
+
     for pid in pids:
         try:
             proc = Process(pid)
@@ -322,9 +345,10 @@ def get_inotify_watches(pids, restrict_uid=None):
             continue
 
         try:
+            # query inotify watches of process
             watches = proc.get_fsnotify_watches()
-        # ignore terminated processes
         except IOError:
+            # ignore terminated processes
             continue
 
         if len(watches) == 0:
@@ -332,12 +356,23 @@ def get_inotify_watches(pids, restrict_uid=None):
                   "process (PID %d)" % pid)
             continue
 
-        # get mount manager per namespace
-        mm = MountManager(proc.pid)
+        # get file system mounts per namespace
+        ns_mtab_key = (proc.get_mount_namespace(), proc.get_pid_namespace())
+        if ns_mtab_key not in namespace_mtabs.keys():
+            debug("get_inotify_watches(): create NamespaceMountTab(PID: " +
+                  "%d) for ns_mtab_key=%s" % (proc.get_pid(), ns_mtab_key))
+
+            ns_mtab = NamespaceMountTab(proc)
+            # cache object in 'namespace_mtabs' to avoid lookup overhead per
+            # process mount/pid namespace
+            namespace_mtabs[ns_mtab_key] = ns_mtab
+        else:
+            ns_mtab = namespace_mtabs[ns_mtab_key]
+
         for watch in watches:
             fsnotify = watch['fsnotify']
             sdev = fsnotify.get_source_device()
-            mount = mm.get_mount_by_device_number(sdev)
+            mount = ns_mtab.get_mount_by_device_number(sdev)
             if not mount:
                 # no idea what's going on here, can't find the corresponding
                 # device
@@ -429,7 +464,8 @@ def print_inotify_watches(watches,
 
 
 def truncate_string(content, length=87):
-    return (content[:length] + '..') if len(content) > 88 else content
+    return (content[:length] + '..') \
+        if len(content) > (length + 2) else content
 
 
 if __name__ == "__main__":
