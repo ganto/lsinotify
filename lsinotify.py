@@ -22,7 +22,7 @@ import subprocess
 import sys
 
 from operator import itemgetter
-from optparse import OptionParser
+from optparse import OptionGroup, OptionParser
 
 DEBUG = False
 
@@ -210,11 +210,17 @@ class Process():
             # cmdline arguments are \0 seperated
             self.cmdline = cmd_fd.readline().replace('\0', ' ').strip()
 
+        proc_details = subprocess.check_output(
+            ["ps", "--no-headings", "-o", "state,uid,mntns,pidns",
+             "-p", "%s" % self.pid]
+        ).split()
+
+        # ignore zombie processes
+        if proc_details[0] == 'Z':
+            raise IOError("PID %d is a zombie" % self.pid)
+
         self.uid, self.mount_ns, self.pid_ns = [
-            int(result.strip()) for result in subprocess.check_output(
-                ["ps", "--no-headings", "-o", "uid,mntns,pidns",
-                 "-p", "%d" % self.pid]
-            ).split()
+            int(result.strip()) for result in proc_details[1:]
         ]
 
         debug("%s" % self)
@@ -266,8 +272,8 @@ def main(argv=None):
     parser = OptionParser(usage=usage)
     parser.add_option('-a', '--all', action='store_true', default=False,
                       help='examine processes of all users (root only!)')
-#    parser.add_option('-c', '--count', action='store_true', default=False,
-#                      help='only show total count')
+    parser.add_option('-c', '--count', action='store_true', default=False,
+                      help='only show total count')
     parser.add_option('-d', '--debug', action='store_true', default=False,
                       help='print debug messages')
 #    parser.add_option('-f', '--format', action='store', type='str', metavar='FORMAT',
@@ -278,30 +284,48 @@ def main(argv=None):
                       help='do not print column headers')
 #    parser.add_option('-o', '--options', action='store', type='str', metavar='STRING',
 #                      help='only show given option columns')
-    parser.add_option('-p', '--pids', action='store', type='str', metavar='NUM[,NUM]',
+    parser.add_option('-p', '--pids', action='store', type='str',
+                      metavar='NUM[,NUM]',
                       help='restrict to list of process IDs')
-#    parser.add_options('-s', '--sort-by', action='store', type='str', metavar='OPTION',
-#                       help='sort output by given column')
+    parser.add_option('-s', '--sort-by', action='store', type='str',
+                      metavar='OPTION',
+                      help='sort output by given option')
     parser.add_option('-u', '--uid', action='store', type='int', metavar='NUM',
                       help='examine processes of given user ID (root only!)')
+    parser.add_option_group(OptionGroup(
+        parser,
+        "Display options",
+        "watch_descriptor    inotify watch descriptor                         "
+        "inode               inode of watched file                            "
+        "path                path of watched file                             "
+        "source_device       source device of watched file                    "
+    ))
+
     (options, args) = parser.parse_args()
 
     if options.all and options.uid:
         parser.error("cannot use '-a|--all' and '-u|uid' at the same time")
 
+    summary_only = False
+    if options.count:
+        summary_only = True
+
     if options.debug:
         global DEBUG
         DEBUG = True
 
+    headers = True
     if options.no_headers:
         headers = False
-    else:
-        headers = True
 
     if options.pids:
         pids = [int(pid) for pid in options.pids.split(',')]
     else:
         pids = [int(pid) for pid in os.listdir('/proc') if pid.isdigit()]
+
+    sort_by = 'watch_descriptor'
+    if options.sort_by:
+        sort_by = options.sort_by
 
     debug("checking PIDs: %s" % ", ".join(str(pid) for pid in pids))
 
@@ -314,7 +338,9 @@ def main(argv=None):
 
     print_inotify_watches(get_inotify_watches(pids=pids,
                                               restrict_uid=uid),
-                          show_headers=headers)
+                          sort_by=sort_by,
+                          show_headers=headers,
+                          summary_only=summary_only)
 
 
 def get_inotify_watches(pids, restrict_uid=None):
@@ -340,7 +366,7 @@ def get_inotify_watches(pids, restrict_uid=None):
 
         # restrict to given uid
         if (restrict_uid is not None) and (restrict_uid != proc.get_uid()):
-            debug("get_inotify_watches(): skipping process (PID %d)" % pid +
+            debug("get_inotify_watches(): skipping process (PID %d) " % pid +
                   "due to UID restriction")
             continue
 
@@ -429,38 +455,38 @@ def get_max_user_watches():
 
 
 def print_inotify_watches(watches,
+                          summary_only=False,
                           show_headers=True,
-                          sort_by='watch_descriptor',
-                          summary=True):
+                          sort_by='watch_descriptor'):
 
     # sort collected watch entries
     output_list = sorted(watches.values(), key=itemgetter(sort_by))
 
     if len(output_list) > 0:
-        if show_headers:
-            print("{:<6} {:<7} {:<10} {:<90} {:<4} {:<6} {:<8} {:<50}".format(
-                'WD', 'SDEV', 'INODE', 'PATH', 'FD', 'PID', 'UID', 'CMD'
-            ))
-
-        for item in output_list:
-            for proc_idx in range(0, len(item['procs'])):
-                # TODO: make width depending on item length
+        if not summary_only:
+            if show_headers:
                 print("{:<6} {:<7} {:<10} {:<90} {:<4} {:<6} {:<8} {:<50}".format(
-                    hex(item['watch_descriptor']),
-                    hex(item['source_device']),
-                    hex(item['inode']),
-                    truncate_string(item['path']),
-                    item['procs'][proc_idx]['fd'],
-                    item['procs'][proc_idx]['pid'],
-                    item['procs'][proc_idx]['uid'],
-                    truncate_string(item['procs'][proc_idx]['cmdline'], 47)
+                      'WD', 'SDEV', 'INODE', 'PATH', 'FD', 'PID', 'UID', 'CMD'
                 ))
+
+            for item in output_list:
+                for proc_idx in range(0, len(item['procs'])):
+                    # TODO: make width depending on item length
+                    print("{:<6} {:<7} {:<10} {:<90} {:<4} {:<6} {:<8} {:<50}".format(
+                        hex(item['watch_descriptor']),
+                        hex(item['source_device']),
+                        hex(item['inode']),
+                        truncate_string(item['path']),
+                        item['procs'][proc_idx]['fd'],
+                        item['procs'][proc_idx]['pid'],
+                        item['procs'][proc_idx]['uid'],
+                        truncate_string(item['procs'][proc_idx]['cmdline'], 47)
+                    ))
     else:
         print("no inotify watches found", file=sys.stderr)
 
-    if summary:
-        print("\nNUM_MAX  NUM_TOTAL")
-        print("%7d  %9d" % (get_max_user_watches(), len(watches.keys())))
+    print("\nNUM_MAX  NUM_TOTAL")
+    print("%7d  %9d" % (get_max_user_watches(), len(watches.keys())))
 
 
 def truncate_string(content, length=87):
